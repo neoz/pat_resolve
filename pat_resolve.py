@@ -1,40 +1,25 @@
 import os
 import re
 import sys
-import google.generativeai as client
-from ratelimit import limits, sleep_and_retry
 
-CALLS = 1
-RATE_LIMIT = 1
 TEST_MODE = False
+GROUPS_LENGTH_MAX = 1000
 
-#template = "Given the following list of function names: {list}. Choose the most appropriate name in the list and respond only with choosen name string."
-template = "Given the following list of list function names: {list}. From each list ,choose the most appropriate name in the list and respond only with choosen name string with seperate by comma."
+def select_best_name(names : list):
+    # find the best name in the list by criteria: min length
+    best_name = min(names, key=len)
+    return best_name
 
-model_name = "gemini-1.5-flash"
+class local_response:
+    def __init__(self, text):
+        self.text = text
 
-api_key = os.environ.get('GEMINI_API_KEY')
-if not api_key:
-    raise ValueError("API key is required, please set the GEMINI_API_KEY environment variable")
+def query_local(groups : list):
+    name_list = []
+    for group in groups:
+        name_list.append(select_best_name(group))
 
-# Set API key cho google-generativeai
-client.configure(api_key=api_key)
-model = client.GenerativeModel(model_name=model_name)
-
-@sleep_and_retry
-@limits(calls=CALLS, period=RATE_LIMIT)
-def query(groups : list, isTest = True) -> str:
-    lst_str = str(groups)
-    input = template.format(list=lst_str)
-    print("----- Request -----")
-    print(input)
-    if isTest:
-        return "Test, Test1, Test2"
-    response = model.generate_content(contents=input)
-    resp_text = response.text #response.text.replace('```json\n', '').replace('```', '')
-    print("----- Response -----")
-    print(resp_text)
-    return resp_text
+    return local_response(",".join(name_list)), "local_request"
 
 def handle_exclude(file_content : str, names_to_exclude : str) -> str:
     names = names_to_exclude.split(',')
@@ -94,10 +79,13 @@ if __name__ == '__main__':
 
     grouped_lines = cleaned_content.split('\n\n')
 
+    print(f"Total of pattern groups: {len(grouped_lines)}")
+
     pattern = r'^(.*?)\t(\w+)\s(\w+)\s(.*)$'
     # process data
     groups = []
-    
+    i = 0
+    lst_group = []
     for group in grouped_lines:
         lines = group.splitlines()
         names = []
@@ -107,22 +95,43 @@ if __name__ == '__main__':
             match = re.match(pattern, line)
             if match:
                 name, data1, data2, signature = match.groups()
+                #ignore sub_ functions
+                if name.startswith("sub_"):
+                    continue
                 names.append(name.strip())
             else:
                 print(f"Could not process: {line}")
         if len(names) > 1:
             groups.append(names)
-        else:
-            print(f"ignore group names {names} has less than 2 names")
+            if len(groups) == GROUPS_LENGTH_MAX:
+                lst_group.append(groups)
+                groups = []   
+        # else:
+        #     print(f"ignore group names {names} has less than 2 names")
 
-    # using generativeai to determine the most appropriate name
     if len(groups) != 0:
-            # print some statistics
-        print(f"Total groups: {len(groups)}")
-        resp_text = query(groups, TEST_MODE)
-    else:
-        resp_text = ""
-    file_content = handle_exclude(file_content=file_content, names_to_exclude=resp_text)
+        lst_group.append(groups)
+
+    name_list = []
+    for i, group in enumerate(lst_group):
+        print(f"Group {i+1}: {len(group)}")
+        if len(group) != 0:
+            # using generativeai to determine the most appropriate name
+            resp, input = query_local(group)
+            print(resp.text)
+            names = resp.text.split(',')
+            if len(names) != len(group):
+                print("----- Request -----")
+                print(input)
+                print("----- Response -----")
+                print(resp)
+                raise ValueError(f"Number of names {len(names)} does not match number of groups {len(group)}")
+            name_list.append(",".join(names))
+        else:
+            raise ValueError("No groups found")
+    
+    data = ",".join(name_list)
+    file_content = handle_exclude(file_content=file_content, names_to_exclude=data)
 
     # rename the file to .old
     # if file_name+".old" exists then remove it
